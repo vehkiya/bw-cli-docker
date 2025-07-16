@@ -37,4 +37,5 @@ COPY --from=builder /entrypoint /entrypoint
 USER nonroot:nonroot
 
 # Set the entrypoint to our compiled Go program.98
+EXPOSE 8080
 ENTRYPOINT ["/entrypoint"]

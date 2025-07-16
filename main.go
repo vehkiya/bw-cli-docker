@@ -2,16 +2,26 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
+	"sync"
+)
+
+var (
+	// Used to ensure the setup process only runs once.
+	setupOnce sync.Once
+
+	// Stores the session key after a successful unlock.
+	sessionKey string
+
+	// Indicates whether the initial setup was successful.
+	isSetupSuccessful bool
 )
 
 func main() {
-	// Check if debug mode is enabled.
-	debugEnabled := os.Getenv("DEBUG_ENABLED") != ""
-
+	// Check for required environment variables.
 	if os.Getenv("BW_CLIENTID") == "" || os.Getenv("BW_CLIENTSECRET") == "" {
 		fmt.Fprintln(os.Stderr, "Fatal: BW_CLIENTID and BW_CLIENTSECRET environment variables must be set.")
 		os.Exit(1)
@@ -21,48 +31,81 @@ func main() {
 		os.Exit(1)
 	}
 
-	mustRun("Configuring server", "bw", "config", "server", os.Getenv("BW_HOST"))
-	mustRun("Logging in with API Key", "bw", "login", "--apikey")
+	// Start the Bitwarden setup and serve process in the background.
+	go setupAndServe()
 
-	fmt.Println("Unlocking vault to get session key...")
-	unlockCmd := exec.Command("bw", "unlock", "--raw", "--passwordenv", "BW_PASSWORD")
-	sessionKeyBytes, err := unlockCmd.Output()
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			fmt.Fprintln(os.Stderr, "Unlock failed:", string(exitError.Stderr))
-		}
+	// Start an HTTP server to handle health checks.
+	http.HandleFunc("/healthz", healthCheckHandler)
+	fmt.Println("Starting health check server on :8080...")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		fmt.Fprintf(os.Stderr, "Fatal: Health check server failed: %v", err)
 		os.Exit(1)
-	}
-	sessionKey := strings.TrimSpace(string(sessionKeyBytes))
-
-	// If debug mode is enabled, print the session key.
-	if debugEnabled {
-		fmt.Printf("DEBUG: Session key obtained: %s\n", sessionKey)
-	}
-
-	os.Setenv("BW_SESSION", sessionKey)
-	mustRun("Checking vault status", "bw", "unlock", "--check")
-
-	fmt.Println("Starting Bitwarden server on port 8087...")
-	bwPath, err := exec.LookPath("bw")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Fatal: Could not find 'bw' executable in PATH")
-		os.Exit(1)
-	}
-
-	args := []string{"bw", "serve", "--hostname", "0.0.0.0", "--port", "8087"}
-	if err := syscall.Exec(bwPath, args, os.Environ()); err != nil {
-		fmt.Fprintln(os.Stderr, "Fatal: Failed to exec 'bw serve':", err)
 	}
 }
 
+// setupAndServe runs the initial Bitwarden configuration and starts the 'bw serve' command.
+func setupAndServe() {
+	setupOnce.Do(func() {
+		mustRun("Configuring server", "bw", "config", "server", os.Getenv("BW_HOST"))
+		mustRun("Logging in with API Key", "bw", "login", "--apikey")
+
+		fmt.Println("Unlocking vault to get session key...")
+		unlockCmd := exec.Command("bw", "unlock", "--raw", "--passwordenv", "BW_PASSWORD")
+		sessionKeyBytes, err := unlockCmd.Output()
+		if err != nil {
+			if exitError, ok := err.(*exec.ExitError); ok {
+				fmt.Fprintln(os.Stderr, "Unlock failed:", string(exitError.Stderr))
+			}
+			return // Don't proceed if unlock fails.
+		}
+		sessionKey = strings.TrimSpace(string(sessionKeyBytes))
+		os.Setenv("BW_SESSION", sessionKey)
+
+		mustRun("Checking vault status", "bw", "unlock", "--check")
+
+		// The initial setup is complete.
+		isSetupSuccessful = true
+		fmt.Println("Initial setup complete. Starting Bitwarden server...")
+
+		// Start the Bitwarden server.
+		cmd := exec.Command("bw", "serve", "--hostname", "0.0.0.0", "--port", "8087")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Fatal: 'bw serve' command failed: %v", err)
+			isSetupSuccessful = false // Mark as unhealthy if the server crashes.
+		}
+	})
+}
+
+// healthCheckHandler responds to Kubernetes health probes.
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	if !isSetupSuccessful {
+		http.Error(w, "Setup not complete or failed", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Run 'bw unlock --check' to ensure the vault is accessible.
+	cmd := exec.Command("bw", "unlock", "--check")
+	cmd.Env = append(os.Environ(), "BW_SESSION="+sessionKey)
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Health check failed: %v", err)
+		http.Error(w, "Health check failed", http.StatusServiceUnavailable)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "OK")
+}
+
+// mustRun executes a command and exits the program if it fails.
 func mustRun(stepName string, commandName string, args ...string) {
-	fmt.Printf("--> %s\n", stepName)
+	fmt.Printf("--> %s", stepName)
 	cmd := exec.Command(commandName, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Fatal: Command failed during '%s': %v\n", stepName, err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Fatal: Command failed during '%s': %v", stepName, err)
+		os.Exit(1) // Exit here because these are critical setup steps.
 	}
 }
