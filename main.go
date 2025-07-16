@@ -1,111 +1,175 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
-)
-
-var (
-	// Used to ensure the setup process only runs once.
-	setupOnce sync.Once
-
-	// Stores the session key after a successful unlock.
-	sessionKey string
-
-	// Indicates whether the initial setup was successful.
-	isSetupSuccessful bool
+	"time"
 )
 
 func main() {
-	// Check for required environment variables.
-	if os.Getenv("BW_CLIENTID") == "" || os.Getenv("BW_CLIENTSECRET") == "" {
-		fmt.Fprintln(os.Stderr, "Fatal: BW_CLIENTID and BW_CLIENTSECRET environment variables must be set.")
+	// 1. Login, Unlock, and get Session Token
+	sessionToken, err := loginAndGetSession()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Bitwarden login failed: %v\n", err)
 		os.Exit(1)
 	}
-	if os.Getenv("BW_PASSWORD") == "" {
-		fmt.Fprintln(os.Stderr, "Fatal: BW_PASSWORD environment variable must be set.")
-		os.Exit(1)
-	}
+	fmt.Println("Bitwarden login successful.")
 
-	// Start the Bitwarden setup and serve process in the background.
-	go setupAndServe()
+	// Set the session token as an environment variable for all child processes
+	os.Setenv("BW_SESSION", sessionToken)
 
-	// Start an HTTP server to handle health checks.
-	http.HandleFunc("/healthz", healthCheckHandler)
-	fmt.Println("Starting health check server on :8080...")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		fmt.Fprintf(os.Stderr, "Fatal: Health check server failed: %v", err)
-		os.Exit(1)
-	}
+	// 2. Start the actual 'bw serve' process in the background
+	go startBwServe("8088")
+
+	// 3. Start our proxy server on the main port (8087)
+	go startProxyServer("8087", "8088")
+
+	// 4. Start the periodic sync
+	go startPeriodicSync()
+
+	// Keep the main goroutine alive
+	select {}
 }
 
-// setupAndServe runs the initial Bitwarden configuration and starts the 'bw serve' command.
-func setupAndServe() {
-	setupOnce.Do(func() {
-		mustRun("Configuring server", "bw", "config", "server", os.Getenv("BW_HOST"))
-		mustRun("Logging in with API Key", "bw", "login", "--apikey")
+// loginAndGetSession handles the full Bitwarden authentication and returns the session token.
+func loginAndGetSession() (string, error) {
+	fmt.Println("Executing Bitwarden login...")
+	host := os.Getenv("BW_HOST")
+	clientID := os.Getenv("BW_CLIENTID")
+	clientSecret := os.Getenv("BW_CLIENTSECRET")
+	password := os.Getenv("BW_PASSWORD")
 
-		fmt.Println("Unlocking vault to get session key...")
-		unlockCmd := exec.Command("bw", "unlock", "--raw", "--passwordenv", "BW_PASSWORD")
-		sessionKeyBytes, err := unlockCmd.Output()
+	if clientID == "" || clientSecret == "" || password == "" {
+		return "", fmt.Errorf("missing one or more required environment variables (BW_CLIENTID, BW_CLIENTSECRET, BW_PASSWORD)")
+	}
+
+	// if custom host is specified, configure bw-cli to use it
+	if host != "" {
+		fmt.Println("Configuring bw-cli to use the supplied host", host)
+		cmdConfig := exec.Command("bw", "config", "server", host)
+		configResult, err := cmdConfig.CombinedOutput()
 		if err != nil {
-			if exitError, ok := err.(*exec.ExitError); ok {
-				fmt.Fprintln(os.Stderr, "Unlock failed:", string(exitError.Stderr))
-			}
-			return // Don't proceed if unlock fails.
+			return "", fmt.Errorf("bw config server failed: %s - %v", string(configResult), err)
 		}
-		sessionKey = strings.TrimSpace(string(sessionKeyBytes))
-		os.Setenv("BW_SESSION", sessionKey)
-
-		mustRun("Checking vault status", "bw", "unlock", "--check")
-
-		// The initial setup is complete.
-		isSetupSuccessful = true
-		fmt.Println("Initial setup complete. Starting Bitwarden server...")
-
-		// Start the Bitwarden server.
-		cmd := exec.Command("bw", "serve", "--hostname", "0.0.0.0", "--port", "8087")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal: 'bw serve' command failed: %v", err)
-			isSetupSuccessful = false // Mark as unhealthy if the server crashes.
-		}
-	})
-}
-
-// healthCheckHandler responds to Kubernetes health probes.
-func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
-	if !isSetupSuccessful {
-		http.Error(w, "Setup not complete or failed", http.StatusServiceUnavailable)
-		return
 	}
 
-	// Run 'bw unlock --check' to ensure the vault is accessible.
-	cmd := exec.Command("bw", "unlock", "--check")
-	cmd.Env = append(os.Environ(), "BW_SESSION="+sessionKey)
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Health check failed: %v", err)
-		http.Error(w, "Health check failed", http.StatusServiceUnavailable)
-		return
+	// Login using API Key
+	cmdLogin := exec.Command("bw", "login", "--apikey")
+	loginOutput, err := cmdLogin.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("bw login failed: %s - %v", string(loginOutput), err)
+	} else {
+		fmt.Println("Logged in successfully")
 	}
 
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, "OK")
+	fmt.Println("Unlocking vault...")
+	// Unlock the vault and get the session key
+	cmdUnlock := exec.Command("bw", "unlock", "--passwordenv", "BW_PASSWORD", "--raw")
+	unlockOutput, err := cmdUnlock.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("bw unlock failed: %s - %v", string(unlockOutput), err)
+	}
+
+	return strings.TrimSpace(string(unlockOutput)), nil
 }
 
-// mustRun executes a command and exits the program if it fails.
-func mustRun(stepName string, commandName string, args ...string) {
-	fmt.Printf("--> %s", stepName)
-	cmd := exec.Command(commandName, args...)
+// startBwServe starts the 'bw serve' process.
+func startBwServe(port string) {
+	fmt.Printf("Starting 'bw serve' on internal port %s\n", port)
+	cmd := exec.Command("bw", "serve", "--hostname", "0.0.0.0", "--port", port)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Fatal: Command failed during '%s': %v", stepName, err)
-		os.Exit(1) // Exit here because these are critical setup steps.
+		fmt.Fprintf(os.Stderr, "FATAL: 'bw serve' process failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// startProxyServer starts the proxy and health check server.
+func startProxyServer(proxyPort, targetPort string) {
+	targetURL, err := url.Parse(fmt.Sprintf("http://localhost:%s", targetPort))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Invalid target URL: %v\n", err)
+		os.Exit(1)
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	mux := http.NewServeMux()
+
+	// Health check endpoint
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "OK")
+	})
+
+	// Sync endpoint
+	mux.HandleFunc("/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		fmt.Println("Executing 'bw sync'...")
+		cmd := exec.Command("bw", "sync")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Sync failed: %s\n", out.String())
+			http.Error(w, fmt.Sprintf("Sync failed: %s", out.String()), http.StatusInternalServerError)
+			return
+		}
+		fmt.Println("Sync successful.")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "Sync successful")
+	})
+
+	// Proxy all other requests to the 'bw serve' process
+	mux.HandleFunc("/", proxy.ServeHTTP)
+
+	fmt.Printf("Starting proxy server on port %s\n", proxyPort)
+	if err := http.ListenAndServe(":"+proxyPort, mux); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Proxy server failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// startPeriodicSync starts a loop that periodically calls the /sync endpoint.
+// The interval is configurable via the BW_SYNC_INTERVAL environment variable (e.g., "2m", "1h").
+func startPeriodicSync() {
+	syncIntervalStr := os.Getenv("BW_SYNC_INTERVAL")
+	if syncIntervalStr == "" {
+		syncIntervalStr = "2m" // Default to 2 minutes
+	}
+
+	syncInterval, err := time.ParseDuration(syncIntervalStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: Invalid format for BW_SYNC_INTERVAL '%s', using default of 2 minutes: %v", syncIntervalStr, err)
+		syncInterval = 2 * time.Minute
+	}
+
+	fmt.Printf("Starting periodic sync every %s\n", syncInterval)
+	ticker := time.NewTicker(syncInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			fmt.Println("Periodic sync triggered...")
+			resp, err := http.Post("http://localhost:8087/sync", "application/json", nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Periodic sync failed: %v", err)
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				fmt.Fprintf(os.Stderr, "Periodic sync failed with status code: %d", resp.StatusCode)
+			}
+			resp.Body.Close()
+		}
 	}
 }
